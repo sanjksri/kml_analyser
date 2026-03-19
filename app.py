@@ -1,409 +1,278 @@
 #!/usr/bin/env python3
 
-"""
-Kamlan: KML Analyzer
-A Streamlit application for analyzing KML/GeoJSON files with satellite imagery,
-DEM, and slope visualization.
-"""
-
 ##############################################
 # Imports
 ##############################################
 import ee
 import requests
-import json
-import numpy as np
 import pandas as pd
 import streamlit as st
 import xml.etree.ElementTree as ET
 import leafmap.foliumap as leaf_folium
-from typing import Optional, Tuple, Any
-from dataclasses import dataclass
-import logging
+import geopandas as gpd
+from shapely.geometry import Polygon
+import tempfile
+import os
 
-from functions import *
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Page configuration
-st.set_page_config(
-    page_title="Kamlan: KML Analyzer",
-    page_icon="🗺️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Must be the first Streamlit command
+st.set_page_config(layout="wide")
 
 ##############################################
-# Constants and Configuration
+# Simplified Functions
 ##############################################
 
-@dataclass
-class MapConfig:
-    """Configuration for map layers"""
-    WAYBACK_URL: str = "https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml"
-    TILE_MATRIX_SET: str = "GoogleMapsCompatible"
-    
-class MapTypes:
-    """Map type constants"""
-    ESRI = "Esri"
-    GOOGLE_HYBRID = "Google Hybrid"
-    GOOGLE_SATELLITE = "Google Satellite"
-
-##############################################
-# INIT FUNCTIONS
-##############################################
-
-@st.cache_resource(show_spinner=False)
-def initialize_ee() -> None:
-    """Initialize Earth Engine with authentication if needed."""
+def initialize_ee():
+    """Initialize Earth Engine with better error handling"""
     try:
         ee.Initialize()
-        logger.info("Earth Engine initialized successfully")
+        st.success("✅ Earth Engine initialized successfully")
+        return True
     except Exception as e:
-        logger.info("Earth Engine not initialized, attempting authentication...")
+        st.warning("⚠️ Earth Engine needs authentication...")
         try:
             ee.Authenticate()
             ee.Initialize()
-            logger.info("Earth Engine authenticated and initialized successfully")
-        except Exception as auth_error:
-            logger.error(f"Failed to authenticate Earth Engine: {auth_error}")
-            st.error("Failed to initialize Earth Engine. Please check your authentication.")
-            st.stop()
+            st.success("✅ Earth Engine authenticated and initialized")
+            return True
+        except Exception as e:
+            st.error(f"❌ Failed to initialize Earth Engine: {str(e)}")
+            st.info("Please run 'earthengine authenticate' in your terminal first")
+            return False
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_wayback_data() -> pd.DataFrame:
-    """
-    Load Wayback imagery data from ArcGIS WMTS capabilities.
-    
-    Returns:
-        DataFrame with imagery dates and resource URLs
-    """
+@st.cache_data(ttl=3600)
+def load_wayback_data():
+    """Load Wayback imagery data with error handling"""
     try:
-        response = requests.get(MapConfig.WAYBACK_URL, timeout=10)
-        response.raise_for_status()
-
-        # Parse XML with namespace handling
-        root = ET.fromstring(response.content)
-        ns = {
-            "wmts": "http://www.opengis.net/wmts/1.0",
-            "ows": "http://www.opengis.net/ows/1.1",
-        }
-
-        layers = root.findall(".//wmts:Contents/wmts:Layer", ns)
+        url = "https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml"
         
-        data = []
-        for layer in layers:
-            title_elem = layer.find("ows:Title", ns)
-            resource = layer.find("wmts:ResourceURL", ns)
+        with st.spinner("Loading satellite imagery catalog..."):
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+
+        # Parse XML
+        root = ET.fromstring(response.content)
+        
+        # Find all layers
+        layers = []
+        for elem in root.findall(".//{http://www.opengis.net/wmts/1.0}Layer"):
+            title = elem.find("{http://www.opengis.net/ows/1.1}Title")
+            resource = elem.find("{http://www.opengis.net/wmts/1.0}ResourceURL")
             
-            if title_elem is not None and resource is not None:
-                data.append({
-                    "Title": title_elem.text,
-                    "ResourceURL_Template": resource.get("template")
+            if title is not None and resource is not None:
+                layers.append({
+                    "Title": title.text,
+                    "URL": resource.get("template")
                 })
 
-        if not data:
-            logger.warning("No layers found in Wayback data")
+        if not layers:
+            st.warning("No layers found in Wayback data")
             return pd.DataFrame()
-
-        df = pd.DataFrame(data)
         
-        # Extract and parse dates
-        dates = df["Title"].str.extract(r"(\d{4}-\d{2}-\d{2})").squeeze()
-        df["date"] = pd.to_datetime(dates, errors="coerce")
+        # Create DataFrame
+        df = pd.DataFrame(layers)
         
-        # Remove rows with invalid dates and sort
-        df = df.dropna(subset=["date"]).sort_values("date", ascending=False)
-        df.set_index("date", inplace=True)
+        # Extract dates from titles
+        dates = []
+        for title in df['Title']:
+            # Try to find date pattern YYYY-MM-DD
+            import re
+            match = re.search(r'(\d{4}-\d{2}-\d{2})', title)
+            if match:
+                dates.append(match.group(1))
+            else:
+                dates.append(None)
         
-        logger.info(f"Loaded {len(df)} Wayback imagery dates")
+        df['date'] = pd.to_datetime(dates)
+        df = df.dropna(subset=['date']).sort_values('date', ascending=False)
+        
         return df
-
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch Wayback data: {e}")
-        return pd.DataFrame()
-    except ET.ParseError as e:
-        logger.error(f"Failed to parse XML response: {e}")
+        
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to load imagery data: {str(e)}")
         return pd.DataFrame()
     except Exception as e:
-        logger.error(f"Unexpected error loading Wayback data: {e}")
+        st.error(f"Error processing imagery data: {str(e)}")
         return pd.DataFrame()
 
-def load_input_data(input_source: Any) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """
-    Load and validate input geospatial data.
-    
-    Args:
-        input_source: Uploaded file or URL
-        
-    Returns:
-        Tuple of (original_gdf, geometry_gdf)
-    """
+def load_kml_geojson(file):
+    """Load KML or GeoJSON file"""
     try:
-        gdf = get_gdf_from_file_url(input_source)
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.name)[1]) as tmp_file:
+            tmp_file.write(file.getvalue())
+            tmp_path = tmp_file.name
         
-        if gdf is None or gdf.empty:
-            st.error("No valid geometries found in the input file")
-            return None, None
-            
-        gdf = preprocess_gdf(gdf)
-
-        # Find first valid polygon
-        for _, row in gdf.iterrows():
-            geometry_df = pd.DataFrame([row])
-            if is_valid_polygon(geometry_df):
-                logger.info("Valid polygon found in input data")
-                return gdf, to_best_crs(geometry_df)
-
-        st.error("No valid polygon geometries found in the input file")
-        return None, None
+        # Read file with geopandas
+        gdf = gpd.read_file(tmp_path)
+        
+        # Clean up
+        os.unlink(tmp_path)
+        
+        if gdf.empty:
+            st.error("No geometries found in file")
+            return None
+        
+        # Ensure we have polygons
+        if not any(gdf.geometry.type.str.contains('Polygon|MultiPolygon')):
+            st.error("File contains no polygon geometries")
+            return None
+        
+        # Filter to keep only polygons
+        gdf = gdf[gdf.geometry.type.str.contains('Polygon|MultiPolygon')]
+        
+        return gdf
         
     except Exception as e:
-        logger.error(f"Error loading input data: {e}")
-        st.error(f"Failed to load input data: {str(e)}")
-        return None, None
+        st.error(f"Error loading file: {str(e)}")
+        return None
 
-def process_wayback_url(row: pd.Series) -> str:
-    """
-    Process Wayback URL template into Leaflet-compatible format.
-    
-    Args:
-        row: DataFrame row with Title and ResourceURL_Template
-        
-    Returns:
-        Formatted URL for Leaflet
-    """
-    url_template = row["ResourceURL_Template"]
+def process_wayback_url(url_template):
+    """Convert Wayback URL template to Leaflet format"""
     return (url_template
-            .replace("{TileMatrixSet}", MapConfig.TILE_MATRIX_SET)
+            .replace("{TileMatrixSet}", "GoogleMapsCompatible")
             .replace("{TileMatrix}", "{z}")
             .replace("{TileRow}", "{y}")
             .replace("{TileCol}", "{x}"))
 
 ##############################################
-# UI Components
-##############################################
-
-def render_header() -> None:
-    """Render application header with logos."""
-    st.markdown("""
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
-        <img src="https://huggingface.co/spaces/SustainabilityLabIITGN/NDVI_PERG/resolve/main/Final_IITGN-Logo-symmetric-Color.png" 
-             alt="IITGN Logo" 
-             style="height:60px; width:auto;">
-        <img src="https://huggingface.co/spaces/SustainabilityLabIITGN/NDVI_PERG/resolve/main/IFS.jpg" 
-             alt="IFS Logo" 
-             style="height:60px; width:auto;">
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown("""
-    <h1 style='text-align:center; color:#2c3e50; margin-bottom:2rem;'>
-        🗺️ Kamlan: KML Analyzer
-    </h1>
-    """, unsafe_allow_html=True)
-
-def render_input_section() -> Optional[Any]:
-    """
-    Render file input section and handle query parameters.
-    
-    Returns:
-        Input source (file or URL) or None
-    """
-    # Check URL parameters first
-    params = st.query_params
-    file_url = params.get("file_url", None)
-    
-    if file_url:
-        st.info(f"📎 Loading file from URL: {file_url}")
-        return file_url
-    
-    # File uploader
-    uploaded_file = st.file_uploader(
-        "📤 Upload KML or GeoJSON file",
-        type=["geojson", "kml"],
-        help="Upload a file containing polygon geometries"
-    )
-    
-    return uploaded_file
-
-@st.fragment
-def render_metrics(geometry_gdf: pd.DataFrame) -> None:
-    """
-    Render geometry metrics.
-    
-    Args:
-        geometry_gdf: GeoDataFrame with geometry
-    """
-    centroid = geometry_gdf.to_crs(4326).centroid.item()
-    area_ha = geometry_gdf.area.item() / 10000
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.metric(
-            "📍 Centroid",
-            f"{centroid.y:.6f}, {centroid.x:.6f}",
-            help="Center point of the polygon (latitude, longitude)"
-        )
-    
-    with col2:
-        st.metric(
-            "📐 Area",
-            f"{area_ha:.2f} ha",
-            help="Total area in hectares"
-        )
-
-@st.fragment
-def render_dem_slope_maps(geometry_gdf: pd.DataFrame, wayback_url: str, wayback_title: str) -> None:
-    """
-    Render DEM and slope maps with caching.
-    
-    Args:
-        geometry_gdf: GeoDataFrame with geometry
-        wayback_url: Base URL for Wayback imagery
-        wayback_title: Title for the imagery layer
-    """
-    if "dem_map" not in st.session_state or "slope_map" not in st.session_state:
-        with st.spinner("🔄 Loading DEM and slope data..."):
-            try:
-                # Convert geometry to Earth Engine format
-                ee_geometry = ee.Geometry(
-                    geometry_gdf.to_crs(4326).geometry.item().__geo_interface__
-                )
-                
-                dem_map, slope_map = get_dem_slope_maps(
-                    ee_geometry,
-                    wayback_url,
-                    wayback_title,
-                )
-                
-                st.session_state.dem_map = dem_map
-                st.session_state.slope_map = slope_map
-                logger.info("DEM and slope maps loaded successfully")
-                
-            except Exception as e:
-                logger.error(f"Failed to load DEM/slope maps: {e}")
-                st.error("Failed to load elevation data. Please try again.")
-                return
-
-    cols = st.columns(2)
-    
-    with cols[0]:
-        st.subheader("🏔️ Digital Elevation Model")
-        if st.session_state.dem_map:
-            st.session_state.dem_map.to_streamlit()
-        else:
-            st.warning("DEM data not available")
-    
-    with cols[1]:
-        st.subheader("📈 Slope Map")
-        if st.session_state.slope_map:
-            st.session_state.slope_map.to_streamlit()
-        else:
-            st.warning("Slope data not available")
-
-##############################################
-# Main Application
+# Main App
 ##############################################
 
 def main():
-    """Main application entry point."""
-    
-    # Initialize
-    initialize_ee()
-    
     # Header
-    render_header()
+    st.markdown("""
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+        <img src="https://huggingface.co/spaces/SustainabilityLabIITGN/NDVI_PERG/resolve/main/Final_IITGN-Logo-symmetric-Color.png" width="120">
+        <h1 style="color:#2c3e50; margin:0;">🗺️ Kamlan: KML Analyzer</h1>
+        <img src="https://huggingface.co/spaces/SustainabilityLabIITGN/NDVI_PERG/resolve/main/IFS.jpg" width="120">
+    </div>
+    """, unsafe_allow_html=True)
     
-    # Input section
-    input_source = render_input_section()
+    # Initialize Earth Engine
+    ee_initialized = initialize_ee()
     
-    if not input_source:
-        st.info("👆 Please upload a file or provide a URL to begin analysis")
+    # File upload
+    uploaded_file = st.file_uploader(
+        "📤 Upload KML or GeoJSON file",
+        type=["kml", "geojson"],
+        help="Upload a file containing polygon geometries"
+    )
+    
+    if uploaded_file is None:
+        st.info("👆 Please upload a file to begin")
         st.stop()
     
-    # Load geospatial data
-    if st.session_state.get("cached_file") != input_source:
-        with st.spinner("📊 Loading and validating geospatial data..."):
-            input_gdf, geometry_gdf = load_input_data(input_source)
-            
-            if geometry_gdf is None:
-                st.error("❌ No valid polygon found in the uploaded file")
-                st.stop()
-            
-            # Cache in session state
-            st.session_state.input_gdf = input_gdf
-            st.session_state.geometry_gdf = geometry_gdf
-            st.session_state.cached_file = input_source
-            
-            # Clear dependent cached data
-            if "dem_map" in st.session_state:
-                del st.session_state.dem_map
-            if "slope_map" in st.session_state:
-                del st.session_state.slope_map
+    # Load the file
+    gdf = load_kml_geojson(uploaded_file)
     
-    # Load Wayback imagery data
-    with st.spinner("🛰️ Loading satellite imagery catalog..."):
-        wayback_df = load_wayback_data()
+    if gdf is None:
+        st.stop()
+    
+    # Display file info
+    st.success(f"✅ Loaded {len(gdf)} polygon(s) from file")
+    
+    # Load Wayback data
+    wayback_df = load_wayback_data()
     
     if wayback_df.empty:
-        st.error("❌ Failed to load satellite imagery data")
-        st.stop()
-    
-    # Get most recent imagery
-    first_item = wayback_df.iloc[0]
-    wayback_title = f"Esri {first_item['Title']}"
-    wayback_url = process_wayback_url(first_item)
+        st.error("Could not load satellite imagery. Using default basemap.")
+        wayback_url = None
+        wayback_title = "Default Imagery"
+    else:
+        # Use most recent imagery
+        latest = wayback_df.iloc[0]
+        wayback_title = f"Esri {latest['Title']}"
+        wayback_url = process_wayback_url(latest['URL'])
+        st.info(f"📅 Latest imagery: {latest['Title']}")
     
     # Map type selection
     map_type = st.radio(
         "🗺️ Select Base Map",
-        [MapTypes.ESRI, MapTypes.GOOGLE_HYBRID, MapTypes.GOOGLE_SATELLITE],
+        ["Esri Wayback", "Google Hybrid", "Google Satellite"],
         horizontal=True,
-        help="Choose the base map layer for visualization"
     )
     
-    # Initialize and display map
-    m = leaf_folium.Map()
+    # Create map
+    m = leaf_folium.Map(center=[20, 78], zoom_start=5)
     
-    if map_type == MapTypes.GOOGLE_HYBRID:
+    # Add basemap
+    if map_type == "Google Hybrid":
         m.add_basemap("HYBRID")
-    elif map_type == MapTypes.GOOGLE_SATELLITE:
+    elif map_type == "Google Satellite":
         m.add_basemap("SATELLITE")
+    elif map_type == "Esri Wayback" and wayback_url:
+        m.add_tile_layer(
+            tiles=wayback_url,
+            name=wayback_title,
+            attribution="Esri"
+        )
     else:
-        m.add_wms_layer(wayback_url, layers="0", name=wayback_title)
+        m.add_basemap("SATELLITE")
     
-    # Add geometry to map
-    add_geometry_to_maps([m], st.session_state.geometry_gdf)
+    # Add uploaded geometry
+    if not gdf.empty:
+        # Convert to GeoJSON
+        geojson = gdf.__geo_interface__
+        
+        # Add to map
+        m.add_geojson(
+            geojson,
+            layer_name="Uploaded Polygon",
+            style={
+                "color": "red",
+                "fillColor": "red",
+                "fillOpacity": 0.1,
+                "weight": 2
+            }
+        )
+        
+        # Zoom to bounds
+        bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
+        m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
     
     # Display map
+    st.subheader("📍 Location Map")
     m.to_streamlit(height=500)
     
-    # Metrics
-    render_metrics(st.session_state.geometry_gdf)
+    # Show metrics
+    col1, col2 = st.columns(2)
     
-    # DEM and Slope maps
-    st.markdown("---")
-    render_dem_slope_maps(
-        st.session_state.geometry_gdf,
-        wayback_url,
-        wayback_title
-    )
+    with col1:
+        # Calculate centroid
+        centroid = gdf.geometry.centroid.iloc[0]
+        st.metric("📍 Centroid", f"{centroid.y:.6f}, {centroid.x:.6f}")
     
-    # Visitor counter
-    st.markdown("---")
-    st.session_state.visits = st.session_state.get("visits", 0) + 1
-    
-    col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
-        st.markdown(
-            f"<div style='text-align:center; color:#7f8c8d;'>"
-            f"👥 Page Views: {st.session_state.visits}</div>",
-            unsafe_allow_html=True
-        )
+        # Calculate area in hectares
+        # Convert to projected CRS for accurate area calculation
+        gdf_projected = gdf.to_crs("EPSG:3857")
+        area_ha = gdf_projected.area.sum() / 10000
+        st.metric("📐 Total Area", f"{area_ha:.2f} ha")
+    
+    # DEM and Slope section (only if EE is initialized)
+    if ee_initialized:
+        st.markdown("---")
+        st.subheader("🏔️ Elevation Analysis")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.info("DEM and slope maps will appear here")
+            # Add your DEM function here if available
+        
+        with col2:
+            st.info("Additional analysis tools coming soon")
+    
+    # Footer with visitor counter
+    st.markdown("---")
+    if 'visits' not in st.session_state:
+        st.session_state.visits = 0
+    st.session_state.visits += 1
+    
+    col1, col2, col3 = st.columns(3)
+    with col2:
+        st.markdown(f"<p style='text-align:center; color:#666;'>👥 Page Views: {st.session_state.visits}</p>", 
+                   unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
