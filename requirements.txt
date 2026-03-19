@@ -1,3 +1,9 @@
+streamlit
+pandas
+numpy
+plotly
+geemap
 leafmap
-geopandas
-optree
+earthengine-api
+branca
+requests
