@@ -3,133 +3,134 @@
 ##############################################
 # Imports
 ##############################################
-import os
-from datetime import datetime
 import ee
+import requests
 import json
 import numpy as np
-import geemap.foliumap as gee_folium
-import leafmap.foliumap as leaf_folium
-import streamlit as st
 import pandas as pd
-import plotly.express as px
-import branca.colormap as cm
+import streamlit as st
 import xml.etree.ElementTree as ET
-import requests
+import leafmap.foliumap as leaf_folium
 
 from functions import *
 
 st.set_page_config(layout="wide")
 
 ##############################################
-# SAFE EARTH ENGINE INIT
+# INIT FUNCTIONS
 ##############################################
-try:
-    ee.Initialize()
-except Exception:
-    ee.Authenticate()
-    ee.Initialize()
+def initialize_ee():
+    try:
+        ee.Initialize()
+    except Exception:
+        ee.Authenticate()
+        ee.Initialize()
 
-############################################
+@st.cache_data(show_spinner=False)
+def load_wayback_data():
+    try:
+        url = "https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml"
+        response = requests.get(url)
+        response.raise_for_status()
+
+        root = ET.fromstring(response.content)
+
+        ns = {
+            "wmts": "https://www.opengis.net/wmts/1.0",
+            "ows": "https://www.opengis.net/ows/1.1",
+        }
+
+        layers = root.findall(".//wmts:Contents/wmts:Layer", ns)
+
+        data = []
+        for layer in layers:
+            title = layer.find("ows:Title", ns)
+            resource = layer.find("wmts:ResourceURL", ns)
+
+            data.append({
+                "Title": title.text if title is not None else "N/A",
+                "ResourceURL_Template": resource.get("template") if resource is not None else "N/A"
+            })
+
+        df = pd.DataFrame(data)
+        df["date"] = pd.to_datetime(
+            df["Title"].str.extract(r"(\d{4}-\d{2}-\d{2})").squeeze(),
+            errors="coerce"
+        )
+        df.set_index("date", inplace=True)
+
+        return df
+
+    except Exception:
+        return pd.DataFrame()
+
+def load_input_data(input_source):
+    gdf = get_gdf_from_file_url(input_source)
+    gdf = preprocess_gdf(gdf)
+
+    for _, row in gdf.iterrows():
+        geometry = pd.DataFrame([row])
+        if is_valid_polygon(geometry):
+            return gdf, to_best_crs(geometry)
+
+    return None, None
+
+##############################################
+# INIT
+##############################################
+initialize_ee()
+
+##############################################
 # HEADER
-############################################
-st.write(
-    """
-    <div style="display: flex; justify-content: space-between; align-items: center;">
-        <img src="https://huggingface.co/spaces/SustainabilityLabIITGN/NDVI_PERG/resolve/main/Final_IITGN-Logo-symmetric-Color.png" style="width: 10%;">
-        <img src="https://huggingface.co/spaces/SustainabilityLabIITGN/NDVI_PERG/resolve/main/IFS.jpg" style="width: 10%;">
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+##############################################
+st.markdown("""
+<div style="display:flex; justify-content:space-between;">
+<img src="https://huggingface.co/spaces/SustainabilityLabIITGN/NDVI_PERG/resolve/main/Final_IITGN-Logo-symmetric-Color.png" width="100">
+<img src="https://huggingface.co/spaces/SustainabilityLabIITGN/NDVI_PERG/resolve/main/IFS.jpg" width="100">
+</div>
+""", unsafe_allow_html=True)
 
 st.markdown("<h1 style='text-align:center;'>Kamlan: KML Analyzer</h1>", unsafe_allow_html=True)
 
-############################################
-# FILE INPUT (FIXED)
-############################################
+##############################################
+# INPUT
+##############################################
 params = st.query_params
 file_url = params.get("file_url", None)
 uploaded_file = st.file_uploader("Upload KML/GeoJSON", type=["geojson", "kml"])
 
-if file_url:
-    input_source = file_url
-elif uploaded_file:
-    input_source = uploaded_file
-else:
-    st.warning("Upload file or provide URL")
+input_source = file_url if file_url else uploaded_file
+
+if not input_source:
+    st.warning("Please upload a file or provide URL.")
     st.stop()
 
-############################################
-# LOAD DATA
-############################################
-if ("cached_file_url" in st.session_state) and (st.session_state.cached_file_url == input_source):
+##############################################
+# LOAD GEO DATA (CACHE)
+##############################################
+if st.session_state.get("cached_file") == input_source:
     input_gdf = st.session_state.input_gdf
     geometry_gdf = st.session_state.geometry_gdf
 else:
-    input_gdf = get_gdf_from_file_url(input_source)
-    input_gdf = preprocess_gdf(input_gdf)
+    input_gdf, geometry_gdf = load_input_data(input_source)
 
-    # FIXED geometry loop
-    for _, row in input_gdf.iterrows():
-        geometry_gdf = pd.DataFrame([row])
-        if is_valid_polygon(geometry_gdf):
-            break
-    else:
-        st.error("No polygon found")
+    if geometry_gdf is None:
+        st.error("No valid polygon found in file.")
         st.stop()
-
-    geometry_gdf = to_best_crs(geometry_gdf)
 
     st.session_state.input_gdf = input_gdf
     st.session_state.geometry_gdf = geometry_gdf
-    st.session_state.cached_file_url = input_source
+    st.session_state.cached_file = input_source
 
-############################################
-# WAYBACK DATA (SAFE)
-############################################
-try:
-    url = "https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml"
-    response = requests.get(url)
-    response.raise_for_status()
+##############################################
+# LOAD WAYBACK
+##############################################
+wayback_df = load_wayback_data()
 
-    root = ET.fromstring(response.content)
-
-    ns = {
-        "wmts": "https://www.opengis.net/wmts/1.0",
-        "ows": "https://www.opengis.net/ows/1.1",
-    }
-
-    layers = root.findall(".//wmts:Contents/wmts:Layer", ns)
-
-    layer_data = []
-    for layer in layers:
-        title = layer.find("ows:Title", ns)
-        resource = layer.find("wmts:ResourceURL", ns)
-
-        layer_data.append({
-            "Title": title.text if title is not None else "N/A",
-            "ResourceURL_Template": resource.get("template") if resource is not None else "N/A"
-        })
-
-    wayback_df = pd.DataFrame(layer_data)
-    wayback_df["date"] = pd.to_datetime(
-        wayback_df["Title"].str.extract(r"(\d{4}-\d{2}-\d{2})").squeeze(),
-        errors="coerce"
-    )
-    wayback_df.set_index("date", inplace=True)
-
-    if wayback_df.empty:
-        st.error("Wayback data unavailable")
-        st.stop()
-
-except Exception:
-    st.error("Wayback loading failed")
+if wayback_df.empty:
+    st.error("Failed to load imagery data.")
     st.stop()
 
-############################################
-# MAP DISPLAY
-############################################
 first_item = wayback_df.iloc[0]
 
 wayback_title = "Esri " + first_item["Title"]
@@ -141,8 +142,11 @@ wayback_url = (
     .replace("{TileCol}", "{x}")
 )
 
+##############################################
+# MAP
+##############################################
 map_type = st.radio(
-    "",
+    "Select Map",
     ["Esri", "Google Hybrid", "Google Satellite"],
     horizontal=True,
 )
@@ -159,49 +163,43 @@ else:
 add_geometry_to_maps([m], geometry_gdf)
 m.to_streamlit()
 
-############################################
-# BASIC METRICS
-############################################
+##############################################
+# METRICS
+##############################################
 centroid = geometry_gdf.to_crs(4326).centroid.item()
 
-st.write(f"📍 Centroid: {centroid.y:.6f}, {centroid.x:.6f}")
-st.write(f"📐 Area (ha): {geometry_gdf.area.item()/10000:.2f}")
+col1, col2 = st.columns(2)
+col1.metric("Centroid", f"{centroid.y:.6f}, {centroid.x:.6f}")
+col2.metric("Area (ha)", f"{geometry_gdf.area.item()/10000:.2f}")
 
-############################################
-# DEM CACHE FIX
-############################################
+##############################################
+# DEM / SLOPE
+##############################################
 if "dem_map" not in st.session_state:
-    dem_map, slope_map = get_dem_slope_maps(
-        ee.Geometry(geometry_gdf.to_crs(4326).geometry.item().__geo_interface__),
-        wayback_url,
-        wayback_title,
-    )
-    st.session_state.dem_map = dem_map
-    st.session_state.slope_map = slope_map
+    with st.spinner("Loading DEM & Slope..."):
+        dem_map, slope_map = get_dem_slope_maps(
+            ee.Geometry(geometry_gdf.to_crs(4326).geometry.item().__geo_interface__),
+            wayback_url,
+            wayback_title,
+        )
+        st.session_state.dem_map = dem_map
+        st.session_state.slope_map = slope_map
 
-############################################
-# DISPLAY DEM
-############################################
 cols = st.columns(2)
 
 for col, param_map, title in zip(
     cols,
     [st.session_state.dem_map, st.session_state.slope_map],
-    ["DEM", "Slope"],
+    ["DEM Map", "Slope Map"],
 ):
     with col:
+        st.subheader(title)
         param_map.to_streamlit()
 
-############################################
-# VISITOR COUNTER (SAFE)
-############################################
-if "visits" not in st.session_state:
-    st.session_state.visits = 0
+##############################################
+# VISITOR COUNTER
+##############################################
+st.session_state.visits = st.session_state.get("visits", 0) + 1
 
-st.session_state.visits += 1
 st.markdown("---")
 st.write(f"👥 Visitors: {st.session_state.visits}")
-
-############################################
-# END
-############################################
